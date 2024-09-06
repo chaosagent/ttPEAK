@@ -5,6 +5,7 @@
 #include "impl/buffers/circular_buffer_types.hpp"
 #include "impl/kernels/kernel_types.hpp"
 #include "impl/program/program.hpp"
+#include "impl/dispatch/command_queue.hpp"
 #include "tt_metal/host_api.hpp"
 #include "common/bfloat16.hpp"
 #include <cstddef>
@@ -220,6 +221,9 @@ double test_noc_bandwidth(Device* device, CommandQueue& cq, long program_latency
 
 double test_matmul(Device* device, CommandQueue& cq, long program_latency, CoreRange core = CoreCoord{0, 0})
 {
+    char *fidelity_string = std::getenv("FIDELITY");
+    int fidelity_num = atoi(fidelity_string == nullptr ? "2" : fidelity_string);
+
     Program program = CreateProgram();
     KernelHandle movement = CreateKernel(
         program,
@@ -232,14 +236,15 @@ double test_matmul(Device* device, CommandQueue& cq, long program_latency, CoreR
         "ttpeak_kernels/compute/matmul.cpp",
         core,
         ComputeConfig{
+            .math_fidelity = (MathFidelity) fidelity_num,
             .math_approx_mode = false,
             .compile_args = {},
             .defines = {}
         }
     );
 
-    constexpr uint32_t n_tiles = 2048; // Must be a multiple of 8
-    constexpr uint32_t cb_tiles = 16; // Must be a multiple of 8
+    constexpr uint32_t n_tiles = 2048*16; // Must be a multiple of 8.
+    constexpr uint32_t cb_tiles = 48; // Must be a multiple of 8
     CBHandle cb0 = MakeCircularBufferBFP16(program, core, tt::CB::c_in0, cb_tiles);
     CBHandle cb1 = MakeCircularBufferBFP16(program, core, tt::CB::c_in1, cb_tiles);
     CBHandle cb_out = MakeCircularBufferBFP16(program, core, tt::CB::c_out0, cb_tiles);
@@ -250,19 +255,35 @@ double test_matmul(Device* device, CommandQueue& cq, long program_latency, CoreR
     EnqueueProgram(cq, program, false);
     Finish(cq);
 
+    // neither of these kernel timing methods are ideal
+    // better to rely on device profiler numbers than these
     std::vector<double> runtimes;
-    for(size_t i = 0; i < experiment_runs; i++)
-    {
-        auto t1 = high_resolution_clock::now();
+#if false
+    auto tid = tt::tt_metal::BeginTraceCapture(device, cq.id());
+    for(size_t i = 0; i < experiment_runs; i++) {
         EnqueueProgram(cq, program, false);
-        Finish(cq);
-        auto t2 = high_resolution_clock::now();
-        auto duration = duration_cast<nanoseconds>(t2 - t1).count();
-        runtimes.push_back(duration);
     }
-    auto real_duration = geometric_mean(runtimes) - program_latency;
+    tt::tt_metal::EndTraceCapture(device, cq.id(), tid);
+    auto t1 = high_resolution_clock::now();
+    tt::tt_metal::ReplayTrace(device, cq.id(), tid, true);
+    auto t2 = high_resolution_clock::now();
+    DumpDeviceProfileResults(device, program);
+    tt::tt_metal::ReleaseTrace(device, tid);
 
-    const size_t matmul_flop = n_tiles * 32 * 32 * (2 * 32 - 1) * core.size();
+    auto real_duration = duration_cast<nanoseconds>(t2 - t1).count();
+#else
+    auto t1 = high_resolution_clock::now();
+    for(size_t i = 0; i < experiment_runs; i++) {
+        EnqueueProgram(cq, program, false);
+    }
+    Finish(cq);
+    auto t2 = high_resolution_clock::now();
+    DumpDeviceProfileResults(device, program);
+
+    auto real_duration = duration_cast<nanoseconds>(t2 - t1).count();
+#endif
+
+    const size_t matmul_flop = (size_t)n_tiles/4 * 32*4 * 32*4 * (2 * 32 - 1) * core.size() * experiment_runs;
     double gflops = (double)matmul_flop / (real_duration - program_latency);
     
     return gflops;
@@ -411,6 +432,9 @@ void print_device_info(Device* device)
 {
     CoreCoord core_grid = device->logical_grid_size();
     CoreCoord compute_with_storage_grid_size = device->compute_with_storage_grid_size();
+    std::set<CoreCoord> eth_cores = device->ethernet_cores();
+    std::unordered_set<CoreCoord> active_eth = device->get_active_ethernet_cores();
+    std::unordered_set<CoreCoord> inactive_eth = device->get_inactive_ethernet_cores();
     std::cout << "Device info:\n"
         << "  Architecture                    : " << arch2name(device->arch()) << "\n"
         << "  Device ID                       : " << device->id() << "\n"
@@ -422,8 +446,28 @@ void print_device_info(Device* device)
         << "  DRAM bank size                  : " << device->bank_size(BufferType::DRAM) / 1024 / 1024 << " MiB\n"
         << "  DRAM channels                   : " << device->num_dram_channels() << "\n"
         << "  DRAM size per channel           : " << device->dram_size_per_channel() / 1024 / 1024 << " MiB\n"
-        << "  Machine epsilon                 : " << device->sfpu_eps() << "\n"
-        << std::endl;
+        << "  Machine epsilon                 : " << device->sfpu_eps() << "\n";
+
+    std::cout
+        << "  Ethernet cores                  :";
+    for (auto core : eth_cores) {
+        std::cout << " " << core.x << "x" << core.y;
+    }
+    std::cout << "\n";
+
+    std::cout
+        << "  Active Ethernet cores           :";
+    for (auto core : active_eth) {
+        std::cout << " " << core.x << "x" << core.y;
+    }
+    std::cout << "\n";
+
+    std::cout
+        << "  Inactive Ethernet cores         :";
+    for (auto core : inactive_eth) {
+        std::cout << " " << core.x << "x" << core.y;
+    }
+    std::cout << std::endl;
 }
 
 void help(std::string_view arg0)
@@ -476,7 +520,7 @@ int main(int argc, char **argv)
 
     }
 
-    Device *device = CreateDevice(device_id);
+    Device *device = CreateDevice(device_id, 1, DEFAULT_L1_SMALL_SIZE, 65536);
     print_device_info(device);
     device->enable_program_cache();
 
