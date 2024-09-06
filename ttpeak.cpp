@@ -467,6 +467,13 @@ void print_device_info(Device* device)
     for (auto core : inactive_eth) {
         std::cout << " " << core.x << "x" << core.y;
     }
+    std::cout << "\n";
+
+    for (auto core : active_eth) {
+        auto [other_device, other_core] = device->get_connected_ethernet_core(core);
+        std::cout << "    core " << core.x << "x" << core.y << " -> device " << other_device << " core " << other_core.x << "x" << other_core.y << "\n";
+    }
+
     std::cout << std::endl;
 }
 
